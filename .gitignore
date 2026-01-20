@@ -1,0 +1,10 @@
+node_modules/
+playwright-report/
+test-results/
+*.har
+*.zip
+*.webm
+*.mp4
+.DS_Store
+.venv/
+.env
