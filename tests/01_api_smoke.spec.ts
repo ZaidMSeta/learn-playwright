@@ -9,7 +9,7 @@ test('api smoke: string-to-filter -> class-data', async ({ page }) => {
   await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
   await page.getByRole('link', { name: 'Winter' }).click(); 
 
-  // 1) resolve cnKey + va
+  //resolve cnKey + va
   const form = {
     term: 'TERM_ID',
     validations: '',
