@@ -3,175 +3,358 @@ import { XMLParser } from 'fast-xml-parser';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-test('Module 6: resolve first course from courses.txt and save class-data XML', async ({ page }) => {
-  // Configuration 
-  const TERM_ID = '3202610';          // gotta automate this later
-  const TERM_LINK_TEXT = 'Winter';    // text of the link you click in the UI
+test.use({ storageState: 'auth.storage.json' });
+
+test('Scrape all courses (logged in) and save class-data XML', async ({ page }) => {
+  test.setTimeout(0);
+
+  // -----------------------------
+  // Configuration (semester-dependent)
+  // -----------------------------
+  const TERM_ID = '3202610';       // TODO: automate later
+  const TERM_LINK_TEXT = 'Winter'; // UI term selection
   const CAMS = 'MCMSTiOFF_MCMSTiMCMST_MCMSTiMHK_MCMSTiSNPOL_MCMSTiCON';
 
-  const coursesPath = path.join(process.cwd(), 'courses.txt');
-  const outDir = path.join(process.cwd(), 'out');
-  const xmlDir = path.join(outDir, 'xml');
-  const resultsPath = path.join(outDir, 'results.ndjson');
+  // pacing: be gentle
+  const DELAY_MS = 250;
 
-  // Ensure output directories exist
+  // -----------------------------
+  // Paths / output layout
+  // -----------------------------
+  const coursesPath = path.join(process.cwd(), 'courses.txt');
+
+  const outDir = path.join(process.cwd(), 'out');
+  const xmlDir = path.join(outDir, 'xml', TERM_ID);
+  const resultsPath = path.join(outDir, `results_${TERM_ID}.ndjson`);
+
   await fs.mkdir(xmlDir, { recursive: true });
 
-  // append one NDJSON record (one JSON object per line)
   async function appendResult(record: any) {
     await fs.appendFile(resultsPath, JSON.stringify(record) + '\n', 'utf8');
   }
 
-  // Read courses.txt into an array
+
+
+
+  await page.route('**/*', async (route) => {
+    const req = route.request();
+    const url = req.url();
+    const method = req.method();
+  
+    // Only guard MyTimetable API calls; let everything else load normally.
+    if (!url.startsWith('https://mytimetable.mcmaster.ca/api/')) {
+      return route.continue();
+    }
+  
+    // Drop telemetry without failing the test.
+    if (url.startsWith('https://mytimetable.mcmaster.ca/api/report-usage')) {
+      return route.abort(); // or route.fulfill({ status: 204, body: '' })
+    }
+  
+    // Allow all GET API requests (UI boot + scraping).
+    if (method === 'GET') {
+      return route.continue();
+    }
+  
+    // Allow our intentional resolver POST.
+    if (
+      method === 'POST' &&
+      url.startsWith('https://mytimetable.mcmaster.ca/api/string-to-filter')
+    ) {
+      return route.continue();
+    }
+  
+    // Block any other non-GET API call as a safety belt.
+    throw new Error(`Blocked non-GET API call: ${method} ${url}`);
+  });
+  
+  // -----------------------------
+  // Load course codes
+  // -----------------------------
   const raw = await fs.readFile(coursesPath, 'utf8');
   const courses = raw
     .split(/\r?\n/)
     .map((s) => s.trim())
     .filter(Boolean)
-    .map((s) => s.replace(/\s+/g, ' ')); // normalize whitespace
+    .map((s) => s.replace(/\s+/g, ' '));
 
   if (courses.length === 0) {
     throw new Error('courses.txt is empty (no course codes to process).');
   }
 
-  // We’ll process ONE course for Module 6
-  const humanCourse = courses[0];
-  console.log(`Processing first course from courses.txt: "${humanCourse}"`);
-
-  //  Grab a browser session (cookies/session state)
-  await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
-
-  // Get a term-valid sample course from suggestions 
-  const suggestionsUrl =
-    `https://mytimetable.mcmaster.ca/api/courses/suggestions` +
-    `?term=${TERM_ID}` +
-    `&cams=${CAMS}` +
-    `&course_add=a` +
-    `&page_num=0&sco=0&sio=1&already=` +
-    `&_=${Date.now()}`;
-
-  const suggestionsRes = await page.request.get(suggestionsUrl, {
-    headers: { 'X-Requested-With': 'XMLHttpRequest' },
-  });
-
-  if (suggestionsRes.status() !== 200) {
-    throw new Error(`suggestions endpoint returned HTTP ${suggestionsRes.status()}`);
+  // -----------------------------
+  // Resume support: skip courses already in results file
+  // -----------------------------
+  const processed = new Set<string>();
+  try {
+    const existing = await fs.readFile(resultsPath, 'utf8');
+    for (const line of existing.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      try {
+        const obj = JSON.parse(line);
+        if (obj?.course) processed.add(String(obj.course));
+      } catch {
+        // ignore malformed lines
+      }
+    }
+  } catch {
+    // no results file yet
   }
 
-  const suggestionsXml = await suggestionsRes.text();
-
-  // Parse the XML response into an object so we can safely extract the first suggestion
-  const parser = new XMLParser({
+  // -----------------------------
+  // Parsing / helpers
+  // -----------------------------
+  const xmlParser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: '@_',
     textNodeName: '#text',
   });
 
-  const suggestionsObj = parser.parse(suggestionsXml);
-
-  const rs = suggestionsObj?.add_suggest?.results?.rs;
-  const items = Array.isArray(rs) ? rs : rs ? [rs] : [];
-
-  if (items.length === 0) {
-    throw new Error('No suggestions returned; cannot pick a sample course to capture tokens.');
+  function extractFirstXmlError(xml: string): string | null {
+    const m = xml.match(/<error>([\s\S]*?)<\/error>/i);
+    return m ? m[1].trim() : null;
   }
 
-  const sampleCourse = items[0]['#text'];
-
-  // grab t/e tokens by watching the real /api/class-data request from the UI
-  await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
-  await page.getByRole('link', { name: TERM_LINK_TEXT }).click();
-
-  // Start waiting BEFORE triggering the action
-  const reqPromise = page.waitForRequest((req) => req.url().includes('/api/class-data'));
-
-  // Trigger the request: type a term-valid course and press Enter
-  const courseBox = page.getByRole('combobox', { name: /Select Course/i });
-  await courseBox.fill(sampleCourse);
-  await courseBox.press('Enter');
-
-  // Capture request URL and extract t/e query params
-  const tokenReq = await reqPromise;
-  const tokenUrl = new URL(tokenReq.url());
-  const t = tokenUrl.searchParams.get('t');
-  const e = tokenUrl.searchParams.get('e');
-
-  if (!t || !e) {
-    throw new Error('Failed to capture t/e tokens from class-data request.');
+  function isTimeTokenError(xml: string): boolean {
+    return /timezone and time/i.test(xml);
   }
 
-  // Module 6: Resolve the real target course (from courses.txt) via string-to-filter
-  const resolveRes = await page.request.post('https://mytimetable.mcmaster.ca/api/string-to-filter', {
-    form: {
-      term: TERM_ID,
-      validations: '',
-      itemnames: humanCourse,
-      input: humanCourse.toLowerCase(),
-      reason: 'CODE_NUMBER',
-      current: '',
-      isimport: '0',
-      strict: '0',
-    },
-    headers: { 'X-Requested-With': 'XMLHttpRequest' },
-  });
-
-  const resolveArr = await resolveRes.json();
-  const first = resolveArr?.[0];
-
-  if (!first) {
-    await appendResult({ course: humanCourse, ok: false, error: 'No resolver result' });
-    console.log('Resolver returned no results.');
-    return;
+  function isNotAuthorized(xml: string): boolean {
+    return /Error\s*7133:\s*Not Authorized/i.test(xml);
   }
 
-  if (first.error) {
-    await appendResult({ course: humanCourse, ok: false, error: first.error });
-    console.log('Resolver error:', first.error);
-    return;
+  async function resolveCourse(humanCourse: string): Promise<
+    | { ok: true; cnKey: string; va: string }
+    | { ok: false; error: string }
+  > {
+    const res = await page.request.post('https://mytimetable.mcmaster.ca/api/string-to-filter', {
+      form: {
+        term: TERM_ID,
+        validations: '',
+        itemnames: humanCourse,
+        input: humanCourse.toLowerCase(),
+        reason: 'CODE_NUMBER',
+        current: '',
+        isimport: '0',
+        strict: '0',
+      },
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+
+    const arr = await res.json();
+    const first = arr?.[0];
+
+    if (!first) return { ok: false, error: 'No resolver result' };
+    if (first.error) return { ok: false, error: String(first.error) };
+
+    return { ok: true, cnKey: String(first.cnKey), va: String(first.va) };
   }
 
-  const cnKey: string = first.cnKey; 
-  const va: string = first.va;
-  console.log('Resolved:', { cnKey, va });
+  // -----------------------------
+  // Token/template capture
+  // Capture the real logged-in /api/class-data URL once, then reuse its params as a template.
+  // We sanitize it to remove any schedule-dependent course/va/rq params.
+  // -----------------------------
+  async function getSuggestionLabels(): Promise<string[]> {
+    const suggestionsUrl =
+      `https://mytimetable.mcmaster.ca/api/courses/suggestions` +
+      `?term=${TERM_ID}` +
+      `&cams=${CAMS}` +
+      `&course_add=a` +
+      `&page_num=0&sco=0&sio=1&already=` +
+      `&_=${Date.now()}`;
 
-  // Fetch class-data XML for the resolved course using captured t/e
-  // use page.request + include t/e + cachebuster
-  const classDataUrl = new URL('https://mytimetable.mcmaster.ca/api/class-data');
-  classDataUrl.searchParams.set('term', TERM_ID);
-  classDataUrl.searchParams.set('course_0_0', cnKey);
-  classDataUrl.searchParams.set('va_0_0', va);
-  classDataUrl.searchParams.set('rq_0_0', '');
-  classDataUrl.searchParams.set('t', t);
-  classDataUrl.searchParams.set('e', e);
-  classDataUrl.searchParams.set('nouser', '1');
-  classDataUrl.searchParams.set('_', Date.now().toString());
+    const res = await page.request.get(suggestionsUrl, {
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
 
-  const classDataRes = await page.request.get(classDataUrl.toString(), {
-    headers: {
-      'X-Requested-With': 'XMLHttpRequest',
-      'Referer': 'https://mytimetable.mcmaster.ca/criteria.jsp',
-    },
-  });
+    if (res.status() !== 200) {
+      throw new Error(`suggestions endpoint returned HTTP ${res.status()}`);
+    }
 
-  const xml = await classDataRes.text();
+    const xml = await res.text();
+    const obj = xmlParser.parse(xml);
 
-  // Save XML to disk
-  const safeName = cnKey.replace(/[^\w.-]+/g, '_');
-  const xmlFileRel = `out/xml/${safeName}.xml`;
-  const xmlFileAbs = path.join(process.cwd(), xmlFileRel);
+    const rs = obj?.add_suggest?.results?.rs;
+    const items = Array.isArray(rs) ? rs : rs ? [rs] : [];
+    return items.map((it: any) => it['#text']).filter(Boolean);
+  }
 
-  await fs.writeFile(xmlFileAbs, xml, 'utf8');
+  type Template = {
+    baseUrl: string;
+    params: Record<string, string>;
+  };
 
-  await appendResult({
-    course: humanCourse,
-    ok: true,
-    cnKey,
-    va,
-    t,
-    e,
-    xmlPath: xmlFileRel,
-    httpStatus: classDataRes.status(),
-  });
+  function sanitizeTemplateParams(params: Record<string, string>): Record<string, string> {
+    const cleaned: Record<string, string> = {};
 
-  console.log(`Saved XML -> ${xmlFileRel}`);
+    for (const [k, v] of Object.entries(params)) {
+      // Strip anything that encodes “currently loaded” course list
+      // Examples: course_4_0, va_4_0, rq_4_0, course_0_1, etc.
+      if (/^(course|va|rq)_\d+_\d+$/.test(k)) continue;
+
+      // Avoid forcing guest mode if present
+      if (k === 'nouser') continue;
+
+      cleaned[k] = v;
+    }
+
+    return cleaned;
+  }
+
+  let suggestionLabels = await getSuggestionLabels();
+  let suggestionIdx = 0;
+
+  async function captureTemplateFromUI(): Promise<Template> {
+    await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
+    await page.getByRole('link', { name: TERM_LINK_TEXT }).click();
+
+    if (suggestionIdx >= suggestionLabels.length) {
+      suggestionLabels = await getSuggestionLabels();
+      suggestionIdx = 0;
+    }
+    const label = suggestionLabels[suggestionIdx++];
+
+    const courseBox = page.getByRole('combobox', { name: /Select Course/i });
+    const reqPromise = page.waitForRequest((req) => req.url().includes('/api/class-data'));
+
+    await courseBox.fill(label);
+    await courseBox.press('Enter');
+
+    const req = await reqPromise;
+    const u = new URL(req.url());
+
+    const params: Record<string, string> = {};
+    for (const [k, v] of u.searchParams.entries()) params[k] = v;
+
+    return {
+      baseUrl: `${u.origin}${u.pathname}`,
+      params: sanitizeTemplateParams(params),
+    };
+  }
+
+  function buildClassDataUrlFromTemplate(template: Template, cnKey: string, va: string): string {
+    const u = new URL(template.baseUrl);
+
+    // Apply sanitized template params first (tokens/session params)
+    for (const [k, v] of Object.entries(template.params)) {
+      u.searchParams.set(k, v);
+    }
+
+    // Force a single-course request
+    u.searchParams.set('term', TERM_ID);
+    u.searchParams.set('course_0_0', cnKey);
+    u.searchParams.set('va_0_0', va);
+    u.searchParams.set('rq_0_0', '');
+
+    // Cachebuster
+    u.searchParams.set('_', Date.now().toString());
+
+    return u.toString();
+  }
+
+  async function fetchClassDataUsingTemplate(template: Template, cnKey: string, va: string) {
+    const url = buildClassDataUrlFromTemplate(template, cnKey, va);
+
+    const res = await page.request.get(url, {
+      headers: {
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://mytimetable.mcmaster.ca/criteria.jsp',
+      },
+    });
+
+    return { status: res.status(), xml: await res.text(), url };
+  }
+
+  // Capture initial template (includes fresh tokens)
+  let template = await captureTemplateFromUI();
+
+  // -----------------------------
+  // Main loop
+  // -----------------------------
+  let okCount = 0;
+  let failCount = 0;
+  const total = courses.length;
+
+  for (let i = 0; i < total; i++) {
+    const humanCourse = courses[i];
+    if (processed.has(humanCourse)) continue;
+
+    const processedSoFar = okCount + failCount;
+    if (processedSoFar > 0 && processedSoFar % 50 === 0) {
+      console.log(`Progress: ${processedSoFar} processed (ok=${okCount}, fail=${failCount})`);
+    }
+
+    // 1) Resolve
+    const resolved = await resolveCourse(humanCourse);
+    if (!resolved.ok) {
+      failCount++;
+      processed.add(humanCourse);
+      await appendResult({ course: humanCourse, ok: false, stage: 'resolve', error: resolved.error });
+      continue;
+    }
+
+    const { cnKey, va } = resolved;
+
+    // 2) Fetch class-data
+    let response = await fetchClassDataUsingTemplate(template, cnKey, va);
+
+    // Refresh template/tokens and retry once if tokens are stale
+    if (isTimeTokenError(response.xml)) {
+      template = await captureTemplateFromUI();
+      response = await fetchClassDataUsingTemplate(template, cnKey, va);
+    }
+
+    // If session expired, stop early
+    if (isNotAuthorized(response.xml)) {
+      await appendResult({
+        course: humanCourse,
+        ok: false,
+        stage: 'class-data',
+        cnKey,
+        va,
+        httpStatus: response.status,
+        error: 'Not Authorized (session expired). Re-run auth.setup to refresh auth.storage.json.',
+      });
+      throw new Error('Not Authorized: session expired. Re-run auth.setup to refresh auth.storage.json.');
+    }
+
+    // 3) Save XML (always save raw response)
+    const safeName = cnKey.replace(/[^\w.-]+/g, '_');
+    const xmlRel = path.join('out', 'xml', TERM_ID, `${safeName}.xml`);
+    const xmlAbs = path.join(process.cwd(), xmlRel);
+    await fs.writeFile(xmlAbs, response.xml, 'utf8');
+
+    // 4) Mark success/failure based on <error> presence
+    const xmlError = extractFirstXmlError(response.xml);
+    if (xmlError) {
+      failCount++;
+      processed.add(humanCourse);
+      await appendResult({
+        course: humanCourse,
+        ok: false,
+        stage: 'class-data',
+        cnKey,
+        va,
+        httpStatus: response.status,
+        xmlPath: xmlRel,
+        error: xmlError,
+      });
+    } else {
+      okCount++;
+      processed.add(humanCourse);
+      await appendResult({
+        course: humanCourse,
+        ok: true,
+        cnKey,
+        va,
+        httpStatus: response.status,
+        xmlPath: xmlRel,
+      });
+    }
+
+    await page.waitForTimeout(DELAY_MS);
+  }
+
+  console.log(`Done. ok=${okCount}, fail=${failCount}, total=${okCount + failCount}`);
 });
