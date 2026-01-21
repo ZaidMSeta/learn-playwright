@@ -11,9 +11,14 @@ test('Scrape all courses (logged in) and save class-data XML', async ({ page }) 
   // -----------------------------
   // Configuration (semester-dependent)
   // -----------------------------
-  const TERM_ID = '3202610';       // TODO: automate later
-  const TERM_LINK_TEXT = 'Winter'; // UI term selection
   const CAMS = 'MCMSTiOFF_MCMSTiMCMST_MCMSTiMHK_MCMSTiSNPOL_MCMSTiCON';
+
+  // Auto-detected from the UI each run (Mode A).
+  // Optional overrides if you ever want to force a specific term:
+  //   TERM_ID=3202610 TERM_LINK_TEXT="2026 Winter" TERM_SEASON=Winter npx playwright test ...
+  let TERM_ID = process.env.TERM_ID ?? '';
+  let TERM_LINK_TEXT = process.env.TERM_LINK_TEXT ?? '';
+
 
   // pacing: be gentle
   const DELAY_MS = 250;
@@ -24,10 +29,9 @@ test('Scrape all courses (logged in) and save class-data XML', async ({ page }) 
   const coursesPath = path.join(process.cwd(), 'courses.txt');
 
   const outDir = path.join(process.cwd(), 'out');
-  const xmlDir = path.join(outDir, 'xml', TERM_ID);
-  const resultsPath = path.join(outDir, `results_${TERM_ID}.ndjson`);
+  let xmlDir = '';
+  let resultsPath = '';
 
-  await fs.mkdir(xmlDir, { recursive: true });
 
   async function appendResult(record: any) {
     await fs.appendFile(resultsPath, JSON.stringify(record) + '\n', 'utf8');
@@ -65,8 +69,80 @@ test('Scrape all courses (logged in) and save class-data XML', async ({ page }) 
     }
   
     // Block any other non-GET API call as a safety belt.
-    throw new Error(`Blocked non-GET API call: ${method} ${url}`);
+    // Safety belt: we don't want non-GET API calls to go out (could be mutating),
+    // but we also don't want harmless telemetry to fail the whole run.
+    return route.abort();
+
   });
+
+    // -----------------------------
+  // Mode A: auto-detect term from the welcome term cards
+  // Reads links like: "2026 Winter" with href "javascript:UU.caseTermContinue(3202610);"
+  // -----------------------------
+  async function detectTermFromUI(): Promise<{ termId: string; termLabel: string }> {
+    await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
+
+    const termLinks = page.locator('a.term-card-title');
+    await termLinks.first().waitFor({ state: 'visible' });
+
+    const terms = await termLinks.evaluateAll((els) => {
+      return els
+        .map((a) => {
+          const label = (a.textContent ?? '').trim();
+          const href = (a as HTMLAnchorElement).getAttribute('href') ?? '';
+          const m = href.match(/caseTermContinue\((\d+)\)/);
+          const id = m ? m[1] : null;
+          return id && label ? { id, label } : null;
+        })
+        .filter(Boolean) as { id: string; label: string }[];
+    });
+
+    if (!terms.length) {
+      throw new Error('Could not find any term cards (a.term-card-title).');
+    }
+
+    const yearFrom = (label: string) => {
+      const m = label.match(/(20\d{2})/);
+      return m ? Number(m[1]) : 0;
+    };
+
+    const seasonRank = (label: string) => {
+      const l = label.toLowerCase();
+      if (l.includes('winter')) return 1;
+      if (l.includes('spring') || l.includes('summer')) return 2; // includes "Spring/Summer"
+      if (l.includes('fall')) return 3;
+      return 0;
+    };
+
+    // Optional: constrain to a season (TERM_SEASON=Winter/Fall/Summer/...)
+    const preferSeason = (process.env.TERM_SEASON ?? '').toLowerCase().trim();
+    const filtered = preferSeason
+      ? terms.filter((t) => t.label.toLowerCase().includes(preferSeason))
+      : terms;
+
+    const picked = [...(filtered.length ? filtered : terms)].sort((a, b) => {
+      const ya = yearFrom(a.label);
+      const yb = yearFrom(b.label);
+      if (ya !== yb) return yb - ya;
+      return seasonRank(b.label) - seasonRank(a.label);
+    })[0];
+
+    return { termId: picked.id, termLabel: picked.label };
+  }
+
+  // If not forced by env vars, detect automatically.
+  if (!TERM_ID || !TERM_LINK_TEXT) {
+    const detected = await detectTermFromUI();
+    TERM_ID = TERM_ID || detected.termId;
+    TERM_LINK_TEXT = TERM_LINK_TEXT || detected.termLabel; // e.g. "2026 Winter"
+    console.log(`Using term: ${TERM_LINK_TEXT} (${TERM_ID})`);
+  }
+
+  // Now that TERM_ID is known, initialize term-specific output paths.
+  xmlDir = path.join(outDir, 'xml', TERM_ID);
+  resultsPath = path.join(outDir, `results_${TERM_ID}.ndjson`);
+  await fs.mkdir(xmlDir, { recursive: true });
+
   
   // -----------------------------
   // Load course codes
