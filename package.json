@@ -2,7 +2,10 @@
   "name": "learn-playwright",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {},
+  "scripts": {
+    "auth:setup": "PWDEBUG=1 playwright test tests/auth.setup.spec.ts --project=chromium --headed",
+    "scrape": "playwright test tests/scrape.spec.ts --reporter=line"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",

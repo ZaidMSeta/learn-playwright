@@ -1,5 +1,21 @@
+/**
+ * template.ts
+ *
+ * MyTimetable's /api/class-data requests include session/token query parameters
+ * that are easiest to obtain by letting the UI generate a real request.
+ *
+ * - captures a real /api/class-data URL from the UI once
+ * - sanitizes the captured query params to remove course-specific fields
+ * - rebuilds class-data URLs by reusing the template params + injecting cnKey/va
+ *
+ * If tokens expire, run.ts recaptures a fresh template and retries once.
+ */
+
+
 import type { Page } from '@playwright/test';
 import type { ScrapeConfig, Template } from './types';
+
+// Remove query params that depend on which courses are currently loaded in the UI.
 
 export function sanitizeTemplateParams(params: Record<string, string>): Record<string, string> {
   const cleaned: Record<string, string> = {};
@@ -15,6 +31,9 @@ export function sanitizeTemplateParams(params: Record<string, string>): Record<s
   }
   return cleaned;
 }
+
+// Trigger a real class-data request by selecting a course suggestion in the UI.
+// then capture the request URL and keep its query params as a template.
 
 export async function captureTemplateFromUI(page: Page, cfg: ScrapeConfig, label: string): Promise<Template> {
   await page.goto('https://mytimetable.mcmaster.ca/criteria.jsp');
@@ -38,10 +57,11 @@ export async function captureTemplateFromUI(page: Page, cfg: ScrapeConfig, label
   };
 }
 
+// Build a class-data URL that reuses the captured template
+// forces a single-course request by setting course_0_0 and va_0_0.
 export function buildClassDataUrlFromTemplate(template: Template, cfg: ScrapeConfig, cnKey: string, va: string): string {
   const u = new URL(template.baseUrl);
 
-  // Apply sanitized template params first (tokens/session params)
   for (const [k, v] of Object.entries(template.params)) {
     u.searchParams.set(k, v);
   }
@@ -52,7 +72,6 @@ export function buildClassDataUrlFromTemplate(template: Template, cfg: ScrapeCon
   u.searchParams.set('va_0_0', va);
   u.searchParams.set('rq_0_0', '');
 
-  // Cachebuster
   u.searchParams.set('_', Date.now().toString());
 
   return u.toString();
